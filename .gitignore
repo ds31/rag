@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# Streamlit
+.streamlit/
+
+# Векторные базы данных (большие файлы)
+chroma_db/
+articles_chroma_db/
+bm25_cache/
+articles_bm25_cache/
+
+# Локальные метаданные
+processed_docs.json
+
+articles_metadata.json
+# PDF файлы
+*.pdf
+
+# Pickle файлы
+*.pkl
+*.pickle
+
+# Временные файлы
+*.tmp
+*.log
+.DS_Store
+
+# База данных
+*.db
+*.sqlite
+*.sqlite3
+
+# Локальные настройки
+.env
