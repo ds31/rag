@@ -106,6 +106,63 @@ llm_template = """
 > ⚠️ *Ответ основан на общих знаниях, не из конкретных статей библиотеки*
 """
 
+def get_available_models():
+    """Получает список доступных моделей Ollama"""
+    try:
+        import requests
+        response = requests.get("http://localhost:11434/api/tags")
+        if response.status_code == 200:
+            models = response.json().get("models", [])
+            return [model["name"] for model in models]
+    except:
+        pass
+    return ["qwen2.5:14b", "deepseek-r1:14b", "qwen3:8b", "llama3:8b", "gemma3:4b"]
+
+def unload_model(model_name):
+    """Выгружает модель из памяти GPU"""
+    try:
+        import requests
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": model_name, "keep_alive": 0}
+        )
+        return response.status_code == 200
+    except:
+        return False
+
+def get_loaded_models():
+    """Получает список загруженных в память моделей"""
+    try:
+        import requests
+        response = requests.get("http://localhost:11434/api/ps")
+        if response.status_code == 200:
+            models = response.json().get("models", [])
+            result = []
+            for model in models:
+                name = model["name"]
+                size_bytes = model.get("size", 0)
+                # Конвертируем байты в GB
+                size_gb = size_bytes / (1024**3)
+                result.append((name, size_gb))
+            return result
+    except:
+        pass
+    return []
+
+def create_model(model_name):
+    """Создает модель с выбранным именем и выгружает предыдущую"""
+    # Выгружаем предыдущую модель если она была
+    if 'current_model' in st.session_state and st.session_state.current_model != model_name:
+        old_model = st.session_state.current_model
+        if unload_model(old_model):
+            st.sidebar.info(f"🗑️ Выгружена модель {old_model}")
+    
+    return OllamaLLM(
+        model=model_name,
+        keep_alive=-1,  # Держим только текущую модель
+        temperature=0.1
+    )
+
 model = OllamaLLM(
     model="qwen2.5:14b",
     keep_alive=-1,  # Никогда не выгружать из памяти
@@ -204,9 +261,34 @@ def process_articles_batch(uploaded_files):
     status_text.text("Обработка завершена!")
     return all_documents, articles_info
 
+def get_embeddings(model_name):
+    """Создает embedding функцию только при необходимости"""
+    return OllamaEmbeddings(model=model_name)
+
 def initialize_articles_retriever():
-    """Инициализирует ретривер для существующих статей"""
-    embeddings = OllamaEmbeddings(model="qwen2.5:14b")
+    """Инициализирует ретривер для существующих статей БЕЗ загрузки модели"""
+    # BM25 ретривер (не требует embeddings)
+    bm25_file = os.path.join(ARTICLES_CACHE_DIR, "articles_bm25.pkl")
+    
+    if os.path.exists(bm25_file):
+        with open(bm25_file, 'rb') as f:
+            bm25_data = pickle.load(f)
+        bm25_retriever = BM25Retriever(
+            vectorizer=bm25_data['bm25'],
+            docs=bm25_data['docs'],
+            k=8,
+            preprocess_func=russian_preprocess
+        )
+        
+        # Возвращаем только BM25 - без векторного поиска
+        return bm25_retriever
+    else:
+        return None
+
+def create_hybrid_retriever(embedding_model_name):
+    """Создает полный гибридный ретривер с embeddings при первом поиске"""
+    # Создаем embeddings только сейчас
+    embeddings = OllamaEmbeddings(model=embedding_model_name)
     
     # Векторное хранилище
     vector_store = Chroma(
@@ -217,41 +299,33 @@ def initialize_articles_retriever():
     
     semantic_retriever = vector_store.as_retriever(
         search_type="mmr",
-        search_kwargs={
-            "k": 8,  # Уменьшено с 20 до 8 для скорости
-            "fetch_k": 16,  # Уменьшено с 40 до 16
-            "lambda_mult": 0.8
-        }
+        search_kwargs={"k": 8, "fetch_k": 16, "lambda_mult": 0.8}
     )
     
     # BM25 поиск
     bm25_file = os.path.join(ARTICLES_CACHE_DIR, "articles_bm25.pkl")
-    
     if os.path.exists(bm25_file):
         with open(bm25_file, 'rb') as f:
             bm25_data = pickle.load(f)
         bm25_retriever = BM25Retriever(
             vectorizer=bm25_data['bm25'],
             docs=bm25_data['docs'],
-            k=8,  # Уменьшено с 15 до 8
+            k=8,
             preprocess_func=russian_preprocess
         )
+        
+        # Гибридный ретривер
+        return EnsembleRetriever(
+            retrievers=[semantic_retriever, bm25_retriever],
+            weights=[0.6, 0.4]
+        )
     else:
-        bm25_retriever = BM25Retriever.from_documents([], preprocess_func=russian_preprocess, k=8)
-    
-    # Гибридный ретривер
-    hybrid_retriever = EnsembleRetriever(
-        retrievers=[semantic_retriever, bm25_retriever],
-        weights=[0.6, 0.4]  # Больше веса семантике для статей
-    )
-    
-    return hybrid_retriever
+        return semantic_retriever
 
-def add_articles_to_retriever(documents):
-    """Добавляет новые статьи в ретривер"""
-    embeddings = OllamaEmbeddings(model="qwen2.5:14b")
+def add_articles_to_retriever(documents, embedding_model):
+    """Добавляет новые статьи - ЗДЕСЬ создаем эмбеддинги"""
+    embeddings = get_embeddings(embedding_model)  # ← Только при добавлении!
     
-    # Добавляем в векторное хранилище
     vector_store = Chroma(
         collection_name="category_management_articles",
         embedding_function=embeddings,
@@ -526,6 +600,53 @@ max_articles_sources = st.sidebar.slider(
     help="Максимальное количество статей для использования в ответе"
 )
 
+# В боковой панели после настроек поиска добавляем:
+st.sidebar.title("🤖 Настройки модели")
+
+# Показываем загруженные модели
+loaded_models = get_loaded_models()
+if loaded_models:
+    st.sidebar.write("**💾 В памяти GPU:**")
+    total_size = 0
+    for name, size_gb in loaded_models:
+        total_size += size_gb
+        st.sidebar.write(f"• {name}: {size_gb:.1f} GB")
+    st.sidebar.write(f"**Всего: {total_size:.1f} GB**")
+    
+    # Кнопка очистки всех моделей
+    if st.sidebar.button("🗑️ Очистить память GPU"):
+        for name, _ in loaded_models:
+            unload_model(name)
+        st.sidebar.success("✅ Память GPU очищена")
+        st.rerun()
+
+# Информация о моделях
+model_info = {
+    "qwen2.5:14b": "🧠 Сбалансированная (9GB) - хорошо для сложных задач",
+    "deepseek-r1:14b": "🎯 Лучшее качество (9GB) - отличное рассуждение", 
+    "qwen3:8b": "⚡ Быстрая (5GB) - хороший баланс скорости и качества",
+    "llama3:8b": "🌟 Стабильная (5GB) - надежный русский язык",
+    "gemma3:4b": "🚀 Сверхбыстрая (3GB) - экономия ресурсов"
+}
+
+# Выбор модели
+available_models = get_available_models()
+selected_model = st.sidebar.selectbox(
+    "Выберите модель:",
+    available_models,
+    index=0 if "qwen2.5:14b" in available_models else 0,
+    format_func=lambda x: f"{x} - {model_info.get(x, 'Модель Ollama')}"
+)
+
+# Создаем/меняем модель только при изменении
+if 'current_model' not in st.session_state or st.session_state.current_model != selected_model:
+    with st.spinner(f"🔄 Переключаю на модель {selected_model}..."):
+        model = create_model(selected_model)
+        st.session_state.current_model = selected_model
+    st.sidebar.success(f"✅ Активна модель {selected_model}")
+else:
+    model = create_model(selected_model)
+
 # Основной интерфейс - Загрузка файлов
 st.header("📥 Загрузка статей")
 
@@ -552,9 +673,9 @@ if uploaded_files:
                     
                     # Обновляем ретривер
                     if st.session_state.articles_retriever is None:
-                        st.session_state.articles_retriever = add_articles_to_retriever(documents)
+                        st.session_state.articles_retriever = add_articles_to_retriever(documents, selected_model)
                     else:
-                        st.session_state.articles_retriever = add_articles_to_retriever(documents)
+                        st.session_state.articles_retriever = add_articles_to_retriever(documents, selected_model)
                     
                     st.session_state.library_loaded = True
                     
@@ -614,6 +735,13 @@ if st.session_state.articles_retriever or search_strategy == "🧠 Только 
                 if st.session_state.articles_retriever:
                     with st.spinner("🔍 Ищу в библиотеке статей..."):
                         search_start = time.time()
+                        
+                        # Проверяем нужно ли создать полный ретривер
+                        if isinstance(st.session_state.articles_retriever, BM25Retriever):
+                            # Первый поиск - создаем полный ретривер с embeddings
+                            with st.spinner("🔄 Инициализирую векторный поиск..."):
+                                st.session_state.articles_retriever = create_hybrid_retriever(selected_model)
+                        
                         docs = st.session_state.articles_retriever.invoke(question)
                         search_time = time.time() - search_start
                         
@@ -634,6 +762,13 @@ if st.session_state.articles_retriever or search_strategy == "🧠 Только 
                 if st.session_state.articles_retriever:
                     with st.spinner("🔍 Ищу в библиотеке статей..."):
                         search_start = time.time()
+                        
+                        # Проверяем нужно ли создать полный ретривер
+                        if isinstance(st.session_state.articles_retriever, BM25Retriever):
+                            # Первый поиск - создаем полный ретривер с embeddings
+                            with st.spinner("🔄 Инициализирую векторный поиск..."):
+                                st.session_state.articles_retriever = create_hybrid_retriever(selected_model)
+                        
                         docs = st.session_state.articles_retriever.invoke(question)
                         search_time = time.time() - search_start
                         
